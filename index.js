@@ -4,7 +4,6 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const Start = require("./Bot/Start.js");
 const ClientBot = require("./Bot/ClientBot.js");
-Start();
 const clientBot = new ClientBot();
 const fs = require("fs");
 const path = require("path");
