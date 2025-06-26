@@ -62,6 +62,11 @@ router.get("/", authenticateToken, async (req, res, next) => {
       { $match: matchStage },
       { $sort: { createdAt: -1 } },
       {
+        $addFields: {
+          clientId: { $toObjectId: "$clientId" }, // convert string to ObjectId
+        },
+      },
+      {
         $lookup: {
           from: "clients",
           localField: "clientId",
@@ -78,7 +83,7 @@ router.get("/", authenticateToken, async (req, res, next) => {
       },
       {
         $addFields: {
-          clientFirstName: "$client.firstname",
+          clientName: "$client.firstname",
         },
       },
       {
@@ -301,213 +306,152 @@ const updateClientBonus = async (clientId, discountPrice) => {
 
 // Create payment with transaction
 router.post("/create", authenticateToken, async (req, res, next) => {
-  const session = await mongoose.startSession();
-
   try {
-    await session.withTransaction(async () => {
-      const {
-        products,
-        clientId,
-        indebtedness,
-        type,
-        discountPrice,
-        cash,
-        terminal,
-        cashback,
-      } = req.body;
+    const {
+      products,
+      clientId,
+      indebtedness,
+      type,
+      discountPrice,
+      cash,
+      terminal,
+      cashback,
+      avialable,
+    } = req.body;
 
-      // Validate required fields
-      if (!products || !Array.isArray(products) || products.length === 0) {
-        throw new Error("Products are required");
-      }
+    // Mahsulotlar sonini kamaytirish
+    for (const item of products) {
+      const product = await ProductSchema.findById(item.productId);
+      if (product) {
+        product.avialable -= item.quantity; // Mahsulot sonini kamaytirish
+        await product.save();
 
-      // Get all product IDs for bulk operations
-      const productIds = products.map((item) => item.productId);
-      const existingProducts = await ProductSchema.find({
-        _id: { $in: productIds },
-      }).session(session);
+        if (product.avialable <= 1) {
+          await monitorStock.monitorStock(product); // Mahsulot tugaganda monitorStock chaqirish
+        }
 
-      // Create a map for quick lookup
-      const productsMap = {};
-      existingProducts.forEach((product) => {
-        productsMap[product._id.toString()] = product;
-      });
-
-      // Prepare bulk operations for products
-      const bulkOps = [];
-      const stockMonitorPromises = [];
-      const productNumberPromises = [];
-
-      for (const item of products) {
-        const product = productsMap[item.productId];
-        if (product) {
-          const newAvailable = product.avialable - item.quantity;
-
-          bulkOps.push({
-            updateOne: {
-              filter: { _id: item.productId },
-              update: { $inc: { avialable: -item.quantity } },
-            },
-          });
-
-          // Schedule stock monitoring (don't await here)
-          if (newAvailable <= 1) {
-            stockMonitorPromises.push(
-              monitorStock.monitorStock({ ...product, avialable: newAvailable })
-            );
-          }
-
-          if (newAvailable <= -1) {
-            productNumberPromises.push(
-              ProductNumber(
-                { ...product, avialable: newAvailable },
-                item.quantity
-              )
-            );
-          }
+        if (product.avialable <= -1) {
+          ProductNumber(product, item.quantity); // Minusga sotilgan miqdor
+          await product.save();
         }
       }
+    }
 
-      // Execute bulk update for products
-      if (bulkOps.length > 0) {
-        await ProductSchema.bulkWrite(bulkOps, { session });
-      }
-
-      // Handle client debt
-      if (indebtedness > 0 && clientId) {
-        await ClientSchema.findByIdAndUpdate(
-          clientId,
-          {
-            $push: {
-              debts: {
-                description: "To'lov qarzi",
-                date: new Date().toISOString().split("T")[0],
-                amount: indebtedness,
-              },
-            },
-          },
-          { session }
-        );
-      }
-
-      if (clientId && discountPrice > 0) {
-        setImmediate(() => updateClientBonus(clientId, discountPrice));
-      }
-      const paymentData = {
-        ...req.body,
-        status: type === "pos" ? "success" : "waiting",
-      };
-      const [payment] = await PaymentSchema.create([paymentData], { session });
-
-      // Update cashbox
-      const cashboxUpdate = {};
-      if (cash > 0)
-        cashboxUpdate.$inc = { ...cashboxUpdate.$inc, cashBalance: cash };
-      if (terminal > 0)
-        cashboxUpdate.$inc = { ...cashboxUpdate.$inc, cardBalance: terminal };
-
-      if (Object.keys(cashboxUpdate).length > 0) {
-        await Cashbox.findOneAndUpdate({}, cashboxUpdate, {
-          session,
-          upsert: true,
+    // Mijozga qarz yozish (agar qarz bo'lsa)
+    if (indebtedness > 0) {
+      const client = await ClientSchema.findById(clientId);
+      if (client) {
+        client.debts.push({
+          description: "To'lov qarzi",
+          date: new Date().toISOString().split("T")[0], // Bugungi sana
+          amount: indebtedness,
         });
+        await client.save();
       }
+    }
 
-      // Handle cashback
-      if (cashback > 0 && clientId) {
-        await ClientSchema.findByIdAndUpdate(
-          clientId,
-          { $inc: { bonus: -cashback } },
-          { session }
-        );
+    // Mijozning bonus hisobini yangilash
+    await updateClientBonus(clientId, discountPrice);
+
+    // To'lovni yaratish
+    const paymentData = {
+      ...req.body,
+      status: type === "pos" ? "success" : "waiting", // type ga qarab statusni o'zgartirish
+    };
+
+    const data = await PaymentSchema.create(paymentData);
+
+    // Cashbox balanslarini yangilash
+    const cashbox = await Cashbox.findOne(); // Birinchi cashbox ni topish
+    if (cashbox) {
+      if (cash > 0) {
+        cashbox.cashBalance += cash; // Naqd pul balansini yangilash
       }
+      if (terminal > 0) {
+        cashbox.cardBalance += terminal; // Terminal orqali to'lov balansini yangilash
+      }
+      if (cashback > 0) {
+        // Cashback mijozning bonus hisobidan chiqariladi
+        const client = await ClientSchema.findById(clientId);
+        if (client) {
+          client.bonus -= cashback; // Bonus hisobidan chiqarish
+          await client.save();
+        }
+      }
+      await cashbox.save();
+    }
 
-      // Execute async operations after transaction
-      setImmediate(() => {
-        Promise.all([...stockMonitorPromises, ...productNumberPromises]).catch(
-          (error) => console.error("Background task error:", error)
-        );
-      });
-
-      res.json(payment);
-    });
+    res.json(data);
   } catch (error) {
     next(error);
-  } finally {
-    await session.endSession();
   }
 });
 
 // Update payment with transaction
 router.put("/update/:id", authenticateToken, async (req, res, next) => {
-  const session = await mongoose.startSession();
-
   try {
-    await session.withTransaction(async () => {
-      const paymentId = req.params.id;
-      const { cash, terminal, cashback } = req.body;
+    const paymentId = req.params.id;
+    const { cash, terminal, cashback } = req.body;
 
-      if (!mongoose.Types.ObjectId.isValid(paymentId)) {
-        throw new Error("Invalid payment ID format");
+    // Avvalgi to'lov ma'lumotlarini topish
+    const oldPayment = await PaymentSchema.findById(paymentId);
+    if (!oldPayment) {
+      return res.status(404).json({ msg: "To'lov topilmadi" });
+    }
+
+    // Cashbox ni topish
+    const cashbox = await Cashbox.findOne();
+    if (!cashbox) {
+      return res.status(404).json({ error: "Cashbox topilmadi" });
+    }
+
+    // Avvalgi to'lov miqdorlarini Cashbox balanslaridan chiqarish
+    if (oldPayment.cash > 0) {
+      cashbox.cashBalance -= oldPayment.cash; // Naqd pul balansidan chiqarish
+    }
+    if (oldPayment.terminal > 0) {
+      cashbox.cardBalance -= oldPayment.terminal; // Terminal balansidan chiqarish
+    }
+    if (oldPayment.cashback > 0) {
+      // Cashback ni mijozning bonus hisobidan chiqarish
+      const client = await ClientSchema.findById(oldPayment.clientId);
+      if (client) {
+        client.bonus -= oldPayment.cashback;
+        await client.save();
       }
+    }
 
-      const oldPayment = await PaymentSchema.findById(paymentId).session(
-        session
-      );
-      if (!oldPayment) {
-        throw new Error("To'lov topilmadi");
+    // Yangi to'lov miqdorlarini Cashbox balanslariga qo'shish
+    if (cash > 0) {
+      cashbox.cashBalance += cash; // Naqd pul balansini yangilash
+    }
+    if (terminal > 0) {
+      cashbox.cardBalance += terminal; // Terminal orqali to'lov balansini yangilash
+    }
+    if (cashback > 0) {
+      // Cashback mijozning bonus hisobiga qo'shiladi
+      const client = await ClientSchema.findById(oldPayment.clientId);
+      if (client) {
+        client.bonus += cashback;
+        await client.save();
       }
+    }
 
-      const cashboxUpdate = { $inc: {} };
+    // Cashbox ni saqlash
+    await cashbox.save();
 
-      if (oldPayment.cash > 0) {
-        cashboxUpdate.$inc.cashBalance = -oldPayment.cash;
+    // To'lovni yangilash
+    const updatedPayment = await PaymentSchema.findByIdAndUpdate(
+      paymentId,
+      req.body,
+      {
+        new: true,
       }
-      if (oldPayment.terminal > 0) {
-        cashboxUpdate.$inc.cardBalance = -oldPayment.terminal;
-      }
+    );
 
-      if (cash > 0) {
-        cashboxUpdate.$inc.cashBalance =
-          (cashboxUpdate.$inc.cashBalance || 0) + cash;
-      }
-      if (terminal > 0) {
-        cashboxUpdate.$inc.cardBalance =
-          (cashboxUpdate.$inc.cardBalance || 0) + terminal;
-      }
-
-      if (Object.keys(cashboxUpdate.$inc).length > 0) {
-        await Cashbox.findOneAndUpdate({}, cashboxUpdate, {
-          session,
-          upsert: true,
-        });
-      }
-
-      // Handle cashback changes
-      if (oldPayment.cashback !== cashback && oldPayment.clientId) {
-        const bonusDiff = (cashback || 0) - (oldPayment.cashback || 0);
-        if (bonusDiff !== 0) {
-          await ClientSchema.findByIdAndUpdate(
-            oldPayment.clientId,
-            { $inc: { bonus: -bonusDiff } },
-            { session }
-          );
-        }
-      }
-
-      // Update payment
-      const updatedPayment = await PaymentSchema.findByIdAndUpdate(
-        paymentId,
-        req.body,
-        { new: true, session }
-      );
-
-      res.json(updatedPayment);
-    });
+    res.json(updatedPayment);
   } catch (error) {
     next(error);
-  } finally {
-    await session.endSession();
   }
 });
 

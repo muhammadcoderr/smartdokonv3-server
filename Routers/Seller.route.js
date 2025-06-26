@@ -6,7 +6,7 @@ let PaymentSchema = require("../Models/Payment");
 let SellerSchema = require("../Models/Seller");
 const authenticateToken = require("../middleware/authenticateToken");
 
-router.get("/", authenticateToken, async (req, res, next) => {
+router.get("/", async (req, res, next) => {
   try {
     const { page = 1, limit = 20, name } = req.query;
     const query = name ? { firstname: { $regex: name, $options: "i" } } : {};
